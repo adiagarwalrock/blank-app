@@ -1,0 +1,12 @@
+[logger]
+
+level = "info"
+messageFormat = "%(asctime)s %(message)s"
+
+
+[server]
+runOnSave = true
+
+
+[browser]
+gatherUsageStats = false

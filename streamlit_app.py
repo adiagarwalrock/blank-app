@@ -1,217 +1,295 @@
 import streamlit as st
 import requests
 import time
-from datetime import datetime
-import json
+from datetime import datetime, timezone
+from dateutil import parser as date_parser
 
-# Page configuration
+# Page config
 st.set_page_config(
-    page_title="Service Status Dashboard",
-    page_icon="🔍",
-    layout="wide",
-    initial_sidebar_state="collapsed"
+    page_title="Service Status Dashboard", page_icon="🔍", layout="centered"
 )
 
-# Initialize session state
-if 'last_refresh' not in st.session_state:
+# Session state
+if "last_refresh" not in st.session_state:
     st.session_state.last_refresh = None
-if 'services_data' not in st.session_state:
+if "services_data" not in st.session_state:
     st.session_state.services_data = {}
 
+
 def get_status_emoji(status):
-    """Return appropriate emoji for status"""
-    if status == 'operational':
-        return "🟢"
-    elif status == 'degraded':
-        return "🟡"
-    elif status == 'outage':
-        return "🔴"
+    return {"operational": "🟢", "degraded": "🟡", "outage": "🔴"}.get(status, "⚪")
+
+
+def parse_indicator_block(data):
+    # Generic Statuspage-like parsing
+    ind = data.get("status", {}).get("indicator", "none")
+    desc = data.get("status", {}).get("description", "")
+    if ind == "none":
+        status = "operational"
+    elif ind in ("minor", "major"):
+        status = "degraded"
     else:
-        return "⚪"
+        status = "outage"
+    # Gather active incidents if present
+    incidents = []
+    for inc in data.get("incidents", []):
+        name = inc.get("name") or inc.get("shortlink") or "Unnamed incident"
+        incidents.append(name)
+    return status, desc, incidents
 
-def check_service_status(service_name, api_url):
-    """Check the status of a service"""
+
+def map_indicator(indicator: str):
+    if indicator in ("none", "operational"):
+        return "operational"
+    if indicator in ("minor", "major", "partial_outage"):
+        return "degraded"
+    return "outage"
+
+
+def check_gcp_component(component_name: str, incidents_url: str):
+    """
+    Fetches all GCP incidents, filters for active ones in North America
+    affecting exactly the given component_name.
+    """
     try:
-        response = requests.get(api_url, timeout=10, headers={'Accept': 'application/json'})
-
-        if response.status_code == 200:
-            data = response.json()
-
-            if service_name == 'OpenAI' and 'status' in data:
-                indicator = data['status'].get('indicator', 'none')
-                if indicator == 'none':
-                    return 'operational', data['status'].get('description', 'All systems operational'), []
-                elif indicator in ['minor', 'major']:
-                    return 'degraded', data['status'].get('description', 'Some issues detected'), []
-                else:
-                    return 'outage', data['status'].get('description', 'Service disruption'), []
-
-            elif service_name == 'Cloudflare' and 'status' in data:
-                indicator = data['status'].get('indicator', 'none')
-                if indicator == 'none':
-                    return 'operational', data['status'].get('description', 'All systems operational'), []
-                elif indicator in ['minor', 'major']:
-                    return 'degraded', data['status'].get('description', 'Some issues detected'), []
-                else:
-                    return 'outage', data['status'].get('description', 'Service disruption'), []
-
-            else:
-                return 'operational', 'All systems operational', []
-
+        resp = requests.get(incidents_url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()  # list of incident objects
+        now = datetime.now(timezone.utc)
+        active_inc = []
+        for inc in data:
+            # Skip if incident has an end time in the past
+            end_ts = inc.get("end")
+            if end_ts and date_parser.isoparse(end_ts) < now:
+                continue
+            # Check component names
+            comps = [c.get("name", "") for c in inc.get("components", [])]
+            # Only North America:
+            desc = inc.get("external_desc", "")
+            updates = [u.get("text", "") for u in inc.get("updates", [])]
+            region_ok = "North America" in desc or any(
+                "North America" in u for u in updates
+            )
+            if component_name in comps and region_ok:
+                active_inc.append(
+                    inc.get("external_desc") or updates[-1] or "No details"
+                )
+        if active_inc:
+            return (
+                "outage",
+                (
+                    f"{len(active_inc)} incident(s) affecting {component_name} in North America"
+                ),
+                active_inc,
+            )
         else:
-            raise Exception(f"HTTP {response.status_code}")
-
+            return (
+                "operational",
+                (f"No active North America incidents for {component_name}"),
+                [],
+            )
     except Exception as e:
-        # Return mock data based on current known outages (as per original code)
-        if service_name == 'Google Cloud':
-            return 'outage', 'Major outage affecting Cloud Console, Storage, IAM, and other services', [
-                'Global Cloud Services Disruption (investigating)'
-            ]
-        elif service_name == 'OpenAI':
-            return 'degraded', 'Monitoring recovery from recent major outage', [
-                'Post-outage monitoring (monitoring)'
-            ]
-        elif service_name == 'Netlify':
-            return 'outage', '502 errors affecting app.netlify.com access', [
-                '502 Errors on app.netlify.com (investigating)'
-            ]
-        elif service_name == 'Cloudflare':
-            return 'operational', 'All systems operational with scheduled maintenance', []
+        return "outage", f"Error fetching GCP incidents: {e}", []
 
-        return 'operational', 'Status check failed - assuming operational', []
+
+def check_openai_component(comp_key: str, proxy_url: str):
+    """
+    Fetches the OpenAI proxy URL, looks for a component whose name
+    contains comp_key, and returns its status, description, and active incidents.
+    Falls back to the global status if no matching component is found.
+    """
+    try:
+        resp = requests.get(
+            proxy_url, timeout=10, headers={"Accept": "application/json"}
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        return "outage", f"Error fetching/parsing OpenAI status: {e}", []
+
+    # Try new root‐level 'components' key, or fall back to nested 'page'
+    components = data.get("components") or data.get(
+        "page", {}).get("components", [])
+    incidents = data.get("incidents") or data.get(
+        "page", {}).get("incidents", [])
+
+    # Find our target component
+    comp = next(
+        (c for c in components if comp_key.lower()
+         in c.get("name", "").lower()), None
+    )
+    if comp:
+        # Some APIs call it 'status', others 'indicator'
+        raw_ind = comp.get("status") or comp.get("indicator", "none")
+        status = map_indicator(raw_ind)
+        desc = comp.get("description", "").strip(
+        ) or "No description available"
+
+        # Gather all incidents that list this component ID
+        comp_id = comp.get("id")
+        active = []
+        for inc in incidents:
+            # incidents might list affected components under 'components' or 'affected_components'
+            affected = inc.get("components") or inc.get(
+                "affected_components") or []
+            affected_ids = [c.get("id") for c in affected]
+            if comp_id in affected_ids:
+                active.append(inc.get("name", "Unnamed incident"))
+
+        return status, desc, active
+
+    # — No matching component: fall back to global status block —
+    root_status = data.get("status") or data.get("page", {}).get("status", {})
+    raw_ind = root_status.get("indicator") or root_status.get("status", "none")
+    status = map_indicator(raw_ind)
+    desc = root_status.get(
+        "description", "").strip() or "No global description"
+
+    return status, desc, []
+
 
 def refresh_all_services():
-    """Refresh status for all services"""
     services = {
-        'Google Cloud': {
-            'url': 'https://status.cloud.google.com/',
-            'api_url': 'https://status.cloud.google.com/incidents.json'
+        # GCP sub-services
+        "GCP: Cloud Run": {
+            "url": "https://status.cloud.google.com/products/adnGEDEt9zWzs8uF1oKA/history",
+            "checker": lambda: check_gcp_component(
+                "Cloud Run", "https://status.cloud.google.com/incidents.json"
+            ),
         },
-        'OpenAI': {
-            'url': 'https://status.openai.com/',
-            'api_url': 'https://status.openai.com/api/v2/status.json'
+        "GCP: Cloud Scheduler": {
+            "url": "https://status.cloud.google.com/products/XXXscheduler/history",
+            "checker": lambda: check_gcp_component(
+                "Cloud Scheduler", "https://status.cloud.google.com/incidents.json"
+            ),
         },
-        'Netlify': {
-            'url': 'https://www.netlifystatus.com/',
-            'api_url': 'https://www.netlifystatus.com/api/v2/status.json'
+        "GCP: Firebase": {
+            "url": "https://status.cloud.google.com/products/YYYfirebase/history",
+            "checker": lambda: check_gcp_component(
+                "Firebase", "https://status.cloud.google.com/incidents.json"
+            ),
         },
-        'Cloudflare': {
-            'url': 'https://www.cloudflarestatus.com/',
-            'api_url': 'https://www.cloudflarestatus.com/api/v2/summary.json'
-        }
+        "GCP: Cloud Storage": {
+            "url": "https://status.cloud.google.com/products/ZZZstorage/history",
+            "checker": lambda: check_gcp_component(
+                "Cloud Storage", "https://status.cloud.google.com/incidents.json"
+            ),
+        },
+        "GCP: Compute Engine": {
+            "url": "https://status.cloud.google.com/products/DixAowEQm45KgqXKP5tR/history",
+            "checker": lambda: check_gcp_component(
+                "Compute Engine", "https://status.cloud.google.com/incidents.json"
+            ),
+        },
+        "GCP: IAM": {
+            "url": "https://status.cloud.google.com/products/adnGEDEt9zWzs8uF1oKA/history",
+            "checker": lambda: check_gcp_component(
+                "Identity and Access Management",
+                "https://status.cloud.google.com/incidents.json",
+            ),
+        },
+        # OpenAI components
+        # OpenAI components, via your proxy URL
+        "OpenAI: Chat": {
+            "url": "https://status.openai.com/",
+            "checker": lambda: check_openai_component(
+                "chat", "https://status.openai.com/proxy/status.openai.com"
+            ),
+        },
+        "OpenAI: Embedding": {
+            "url": "https://status.openai.com/",
+            "checker": lambda: check_openai_component(
+                "embedding", "https://status.openai.com/proxy/status.openai.com"
+            ),
+        },
+        # legacy services
+        "Netlify": {
+            "url": "https://www.netlifystatus.com/",
+            "api_url": "https://www.netlifystatus.com/api/v2/summary.json",
+        },
+        "Cloudflare": {
+            "url": "https://www.cloudflarestatus.com/",
+            "api_url": "https://www.cloudflarestatus.com/api/v2/status.json",
+        },
     }
 
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-
-    for i, (service_name, service_info) in enumerate(services.items()):
-        status_text.text(f"Checking {service_name}...")
-        status, message, incidents = check_service_status(service_name, service_info['api_url'])
-
-        st.session_state.services_data[service_name] = {
-            'status': status,
-            'message': message,
-            'incidents': incidents,
-            'url': service_info['url'],
-            'last_checked': datetime.now()
+    prog = st.progress(0)
+    info = st.empty()
+    total = len(services)
+    for i, (name, cfg) in enumerate(services.items()):
+        info.text(f"Checking {name}...")
+        if "checker" in cfg:
+            status, msg, incs = cfg["checker"]()
+        else:
+            # fallback to generic statuspage parsing
+            resp = requests.get(cfg["api_url"], headers={
+                                "Accept": "application/json"})
+            status, msg, incs = parse_indicator_block(resp.json())
+        st.session_state.services_data[name] = {
+            "status": status,
+            "message": msg,
+            "incidents": incs,
+            "url": cfg.get("url"),
+            "last_checked": datetime.now(),
         }
-
-        progress_bar.progress((i + 1) / len(services))
-        time.sleep(0.5)  # Small delay between requests
-
-    progress_bar.empty()
-    status_text.empty()
+        prog.progress((i + 1) / total)
+        time.sleep(0.2)
+    prog.empty()
+    info.empty()
     st.session_state.last_refresh = datetime.now()
 
-# Main dashboard
-st.title("🔍 Service Status Dashboard")
-st.markdown("Monitor the health of critical cloud services")
 
-# Header with refresh button
+# UI
+st.title("🔍 Detailed Service Status Dashboard")
 col1, col2 = st.columns([3, 1])
 with col2:
-    if st.button("🔄 Refresh All", type="primary"):
+    if st.button("🔄 Refresh All"):
         refresh_all_services()
         st.rerun()
 
-# Auto-refresh every 5 minutes
 if st.session_state.last_refresh is None:
-    with st.spinner("Loading service status..."):
+    with st.spinner("Loading statuses..."):
         refresh_all_services()
 
-# Last updated info
-if st.session_state.last_refresh:
-    st.caption(f"Last updated: {st.session_state.last_refresh.strftime('%H:%M:%S')}")
+st.caption(f"Last updated: {st.session_state.last_refresh:%Y-%m-%d %H:%M:%S}")
 
-# Current outage alert
-st.error("""
-🚨 **Live Outage Status - June 12, 2025**
+# overall banner
+statuses = [d["status"] for d in st.session_state.services_data.values()]
+if all(s == "operational" for s in statuses):
+    st.success("🟢 All Systems Fully Operational")
+elif any(s == "outage" for s in statuses):
+    st.error("🔴 One or more services are down")
+else:
+    st.warning("🟡 Some services are reporting degraded performance")
 
-**Real-time status from official service pages:**
-- **Google Cloud:** 🔴 Major outage affecting 50+ services (Cloud Console, Storage, IAM)
-- **Netlify:** 🔴 502 errors on app.netlify.com
-- **OpenAI:** 🟡 Monitoring recovery from recent major outage
-- **Cloudflare:** 🟢 Operational with scheduled maintenance
-""")
+# show cards two-column
+cols = st.columns(2)
+for idx, (svc, data) in enumerate(st.session_state.services_data.items()):
+    c = cols[idx % 2]
+    with c:
+        emo = get_status_emoji(data["status"])
+        st.markdown(f"### {emo} {svc}")
+        if data["status"] == "operational":
+            st.success(data["message"])
+        elif data["status"] == "degraded":
+            st.warning(data["message"])
+        else:
+            st.error(data["message"])
+        if data["incidents"]:
+            st.markdown("**Active Incident Details:**")
+            for inc in data["incidents"]:
+                st.markdown(f"- {inc}")
+        st.caption(f"Last checked: {data['last_checked']:%H:%M:%S}")
+        if data["url"]:
+            st.markdown(f"[🔗 Official Status Page]({data['url']})")
+        st.divider()
 
-# Overall status banner
-if st.session_state.services_data:
-    statuses = [data['status'] for data in st.session_state.services_data.values()]
-
-    if all(status == 'operational' for status in statuses):
-        st.success("🟢 **All Systems Operational** - All monitored services are running normally")
-    elif any(status == 'outage' for status in statuses):
-        st.error("🔴 **Service Disruptions Detected** - One or more services are experiencing outages")
-    else:
-        st.warning("🟡 **Some Services Degraded** - One or more services are experiencing issues")
-
-# Service status cards
-if st.session_state.services_data:
-    # Create two columns for better layout
-    col1, col2 = st.columns(2)
-
-    services_list = list(st.session_state.services_data.items())
-
-    for i, (service_name, service_data) in enumerate(services_list):
-        # Alternate between columns
-        current_col = col1 if i % 2 == 0 else col2
-
-        with current_col:
-            # Create container for each service
-            with st.container():
-                # Service header with status
-                status_emoji = get_status_emoji(service_data['status'])
-                st.markdown(f"### {status_emoji} {service_name}")
-
-                # Status message
-                if service_data['status'] == 'operational':
-                    st.success(service_data['message'])
-                elif service_data['status'] == 'degraded':
-                    st.warning(service_data['message'])
-                else:
-                    st.error(service_data['message'])
-
-                # Incidents (if any)
-                if service_data['incidents']:
-                    st.markdown("**Active Incidents:**")
-                    for incident in service_data['incidents']:
-                        st.markdown(f"• {incident}")
-
-                # Last checked and link
-                col_time, col_link = st.columns([3, 1])
-                with col_time:
-                    st.caption(f"⏰ Last checked: {service_data['last_checked'].strftime('%H:%M:%S')}")
-                with col_link:
-                    st.markdown(f"[🔗 Status Page]({service_data['url']})")
-
-                st.divider()
-
-# Implementation note
-st.info("""
+st.info(
+    """
 💡 **Live Status Information**
 
 This dashboard displays **actual current outage data** based on real-time monitoring of official status pages.
-The status shown reflects genuine service disruptions happening right now (as of June 12, 2025).
+The status shown reflects genuine service disruptions happening right now.
 
 **Official Status Pages:**
 - Google Cloud: https://status.cloud.google.com/
@@ -220,18 +298,11 @@ The status shown reflects genuine service disruptions happening right now (as of
 - Cloudflare: https://www.cloudflarestatus.com/
 
 **Note:** For production use, implement a backend proxy to fetch status data and avoid CORS limitations.
-""")
+"""
+)
 
-# Footer
 st.markdown("---")
-st.markdown("""
-<div style='text-align: center'>
-<small>This dashboard monitors Google Cloud, OpenAI, Netlify, and Cloudflare services with real-time outage detection.<br>
-Status updates based on official service status pages</small>
-</div>
-""", unsafe_allow_html=True)
-
-# Auto-refresh timer (optional)
-if st.checkbox("Enable auto-refresh (5 minutes)", value=False):
-    time.sleep(300)  # 5 minutes
-    st.rerun()
+st.markdown(
+    "<small>Tracks individual GCP products (North America only) and OpenAI sub-systems for chat & embeddings, plus Netlify & Cloudflare.</small>",
+    unsafe_allow_html=True,
+)
